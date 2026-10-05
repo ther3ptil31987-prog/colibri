@@ -68,9 +68,11 @@
 
 #include "cli_args.h"
 #include "json.h"
+#include "stop_ids.h"
 #include "st.h"
 #include "quant.h"
 #include "tok.h"
+#include "omp_tune.h"
 #ifdef COLI_METAL
 #include "backend_metal.h"
 static int g_metal_ready = 0;
@@ -89,6 +91,8 @@ static int g_vk_ready = 0;
 #include "compat.h"
 #include "serve_poll.h"          /* CANCEL a meta' turno (#1332) */
 #include "route_trace.h"
+#include "decode_batch.h"   /* coli_submit_ext, coli_logprob_tail: canale logprobs */
+#include "pin_pool.h"       /* piu scatti annidati dello stato */
 #include <time.h>
 #ifndef _WIN32
 #include <sys/resource.h>
@@ -291,8 +295,8 @@ static void load_cfg(Cfg *c, const char *snap) {
         } else {
             jval *kinds = json_get(tc, "mlp_layer_types");
             if (!kinds || kinds->t != J_ARR) {
-                fprintf(stderr, "config.json: serve first_k_dense_replace "
-                                "oppure mlp_layer_types\n");
+                fprintf(stderr, "config.json: requires first_k_dense_replace "
+                                "or mlp_layer_types\n");
                 exit(1);
             }
             c->first_dense = kinds->len;
@@ -724,9 +728,9 @@ static const float *load_f32(GModel *m, const char *fmt, ...) {
     char name[512];
     va_list args; va_start(args, fmt); vsnprintf(name, sizeof(name), fmt, args); va_end(args);
     st_tensor *t = st_find(&m->S, name);
-    if (!t) { fprintf(stderr, "manca il tensore %s\n", name); exit(1); }
+    if (!t) { fprintf(stderr, "missing tensor %s\n", name); exit(1); }
     float *buffer = malloc((size_t)t->numel * sizeof(float));
-    if (!buffer) { fprintf(stderr, "OOM su %s\n", name); exit(1); }
+    if (!buffer) { fprintf(stderr, "OOM on %s\n", name); exit(1); }
     st_read_f32_cap(&m->S, name, buffer, t->numel, 0);
     return buffer;
 }
@@ -741,7 +745,7 @@ static int glm53_dense_bits(void) {
     const char *setting = getenv("GLM53_BITS");
     cached = setting ? atoi(setting) : 4;
     if (cached != 4 && cached != 8 && cached != 32) {
-        fprintf(stderr, "GLM53_BITS=%s: valori ammessi 4, 8, 32\n", setting);
+        fprintf(stderr, "GLM53_BITS=%s: allowed values are 4, 8, 32\n", setting);
         exit(1);
     }
     return cached;
@@ -792,7 +796,7 @@ static Mat quantize_loaded(float *buffer, int rows, int columns) {
         const int groups = columns / 64;
         uint8_t *packed = malloc((size_t)rows * ((columns + 1) / 2));
         float *step = malloc((size_t)rows * groups * sizeof(float));
-        if (!packed || !step) { fprintf(stderr, "OOM quantizzando %dx%d\n", rows, columns); exit(1); }
+        if (!packed || !step) { fprintf(stderr, "OOM quantizing %dx%d\n", rows, columns); exit(1); }
         quantize_i4_grouped(buffer, packed, step, rows, columns, 64);
         free(buffer);
         mat.fmt = 4; mat.q4 = packed; mat.s = step; mat.gs = 64;
@@ -802,7 +806,7 @@ static Mat quantize_loaded(float *buffer, int rows, int columns) {
      * di 64, che capita sulle proiezioni piccole dell'indexer. */
     int8_t *level = malloc((size_t)rows * columns);
     float *step = malloc((size_t)rows * sizeof(float));
-    if (!level || !step) { fprintf(stderr, "OOM quantizzando %dx%d\n", rows, columns); exit(1); }
+    if (!level || !step) { fprintf(stderr, "OOM quantizing %dx%d\n", rows, columns); exit(1); }
     quantize_rows(buffer, level, step, rows, columns, 8);
     free(buffer);
     mat.fmt = 1; mat.q8 = level; mat.s = step;
@@ -833,16 +837,16 @@ static void absorb_kvb(GModel *m, GLayer *l, const char *name) {
     const Cfg *c = &m->c;
     const int H = c->n_heads, QK = c->qk_nope, V = c->v_head, L = c->kv_lora;
     st_tensor *t = st_find(&m->S, name);
-    if (!t) { fprintf(stderr, "manca %s\n", name); exit(1); }
+    if (!t) { fprintf(stderr, "missing %s\n", name); exit(1); }
     if (t->numel != (int64_t)H * (QK + V) * L) {
-        fprintf(stderr, "%s: %lld valori, attesi %lld per %d teste\n", name,
+        fprintf(stderr, "%s: %lld values, expected %lld for %d heads\n", name,
                 (long long)t->numel, (long long)H * (QK + V) * L, H);
         exit(1);
     }
     float *whole = malloc((size_t)t->numel * sizeof(float));
     float *kt = malloc((size_t)H * L * QK * sizeof(float));
     float *vv = malloc((size_t)H * V * L * sizeof(float));
-    if (!whole || !kt || !vv) { fprintf(stderr, "OOM su %s\n", name); exit(1); }
+    if (!whole || !kt || !vv) { fprintf(stderr, "OOM on %s\n", name); exit(1); }
     st_read_f32_cap(&m->S, name, whole, t->numel, 1);
 
     for (int h = 0; h < H; h++) {
@@ -864,7 +868,7 @@ static Mat load_mat(GModel *m, const char *fmt, ...) {
     char name[512];
     va_list args; va_start(args, fmt); vsnprintf(name, sizeof(name), fmt, args); va_end(args);
     st_tensor *t = st_find(&m->S, name);
-    if (!t) { fprintf(stderr, "manca la matrice %s\n", name); exit(1); }
+    if (!t) { fprintf(stderr, "missing matrix %s\n", name); exit(1); }
     Mat mat; memset(&mat, 0, sizeof(mat));
 
     /* Gia' quantizzato nel checkpoint: si prende com'e', senza passare per
@@ -875,7 +879,7 @@ static Mat load_mat(GModel *m, const char *fmt, ...) {
         snprintf(scales, sizeof(scales), "%s.qs", name);
         st_tensor *qs = st_find(&m->S, scales);
         if (!qs) {
-            fprintf(stderr, "%s e' int4 ma manca %s\n", name, scales);
+            fprintf(stderr, "%s e' int4 ma missing %s\n", name, scales);
             exit(1);
         }
         /* Il contenitore e' piatto: 4.194.304 byte di nibble e 131.072 scale,
@@ -891,33 +895,33 @@ static Mat load_mat(GModel *m, const char *fmt, ...) {
          * la strada e' quella di kimi_k3: la forma la passa il chiamante. */
         const int64_t values = qs->numel * 64;
         if (t->nbytes * 2 != values) {
-            fprintf(stderr, "%s: %lld byte e %lld scale non sono un int4 gs64\n",
+            fprintf(stderr, "%s: %lld bytes and %lld scales do not form int4 gs64\n",
                     name, (long long)t->nbytes, (long long)qs->numel);
             exit(1);
         }
         if (t->rank != 2) {
-            fprintf(stderr, "%s: contenitore int4 piatto fuori dagli esperti; "
-                            "la forma non e' nel file e non si indovina\n", name);
+            fprintf(stderr, "%s: flat int4 container outside routed experts; "
+                            "the shape is not stored in the file and cannot be inferred\n", name);
             exit(1);
         }
         mat.rows = (int)t->shape[0];
         mat.columns = (int)(values / t->shape[0]);
         if (mat.columns % 64) {
-            fprintf(stderr, "%s: %d colonne non sono multiple di 64\n", name, mat.columns);
+            fprintf(stderr, "%s: %d columns are not multiples of 64\n", name, mat.columns);
             exit(1);
         }
         uint8_t *packed = malloc((size_t)t->nbytes);
         float *step = malloc((size_t)qs->numel * sizeof(float));
-        if (!packed || !step) { fprintf(stderr, "OOM su %s\n", name); exit(1); }
+        if (!packed || !step) { fprintf(stderr, "OOM on %s\n", name); exit(1); }
         st_read_raw(&m->S, name, packed, 1);
         st_read_f32_cap(&m->S, scales, step, qs->numel, 1);
         mat.fmt = 4; mat.q4 = packed; mat.s = step; mat.gs = 64; mat.resident = 1;
         return mat;
     }
 
-    if (t->rank != 2) { fprintf(stderr, "%s: rank %d, attesa 2\n", name, t->rank); exit(1); }
+    if (t->rank != 2) { fprintf(stderr, "%s: rank %d, expected 2\n", name, t->rank); exit(1); }
     float *buffer = malloc((size_t)t->numel * sizeof(float));
-    if (!buffer) { fprintf(stderr, "OOM su %s\n", name); exit(1); }
+    if (!buffer) { fprintf(stderr, "OOM on %s\n", name); exit(1); }
     st_read_f32_cap(&m->S, name, buffer, t->numel, 1);
     mat.rows = (int)t->shape[0];
     mat.columns = (int)t->shape[1];
@@ -967,7 +971,7 @@ static void mv(float *out, const Mat *w, const float *x) {
     }
 #endif
 #ifdef COLI_VULKAN
-    if (g_vk_ready && (w->fmt == 1 || w->fmt == 4)) {
+    if (g_vk_ready && w->resident && (w->fmt == 1 || w->fmt == 4)) {
         Mat *mutable_w = (Mat *)w;
         if (coli_vk_matmul((ColiVkTensor **)&mutable_w->vk, out, x,
                            w->fmt == 4 ? (const void *)w->q4 : (const void *)w->q8,
@@ -1120,7 +1124,7 @@ static void mla_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
     if (coli_sparse_index_select_range(selected, iq, ik, gates, head_w, l->ikpa, valid,
                                        seen, IH, ID, c->index_kpool, c->index_topk,
                                        c->index_kpool_tail, base, seen)) {
-        fprintf(stderr, "selezione indexer fallita\n"); exit(1);
+        fprintf(stderr, "indexer selection failed\n"); exit(1);
     }
     /* GLM53_DUMP_INDEX=1 stampa le righe scelte dall'indexer: e' il primo
      * posto da guardare quando il motore diverge solo su certe lunghezze. */
@@ -1240,7 +1244,7 @@ static void expert_table_init(GModel *m) {
         "down_proj.weight", "down_proj.weight.qs",
     };
     m->eref = calloc((size_t)c->n_layers * c->n_experts, sizeof(*m->eref));
-    if (!m->eref) { fprintf(stderr, "OOM sulla tabella degli esperti\n"); exit(1); }
+    if (!m->eref) { fprintf(stderr, "OOM allocating expert table\n"); exit(1); }
 
     const int from = c->first_dense > m->layer_begin ? c->first_dense : m->layer_begin;
     for (int i = from; i < m->layer_end; i++) {
@@ -1251,9 +1255,9 @@ static void expert_table_init(GModel *m) {
                 snprintf(name, sizeof(name), "%slayers.%d.mlp.experts.%d.%s",
                          m->prefix, i, e, piece[p]);
                 st_tensor *t = st_find(&m->S, name);
-                if (!t) { fprintf(stderr, "manca %s\n", name); exit(1); }
+                if (!t) { fprintf(stderr, "missing %s\n", name); exit(1); }
                 if (t->nbytes != m->e_len[p]) {
-                    fprintf(stderr, "%s: %lld byte, attesi %lld\n", name,
+                    fprintf(stderr, "%s: %lld bytes, expected %lld\n", name,
                             (long long)t->nbytes, (long long)m->e_len[p]);
                     exit(1);
                 }
@@ -1273,15 +1277,6 @@ static void expert_table_init(GModel *m) {
 /* Quanti slot per layer: il budget diviso i layer sparsi. Il pavimento e' 1 e
  * non topk, perche' un pavimento a topk impegnerebbe topk*layer slot comunque,
  * cioe' molti GB, a dispetto del budget chiesto. */
-/* Quanta RAM il sistema dice di poter dare adesso. MemAvailable e non MemFree:
- * la seconda ignora la page cache riutilizzabile e farebbe stimare molto meno
- * di quello che c'e'. */
-static double memory_available_gb(void) {
-    /* #1375: era una lettura di /proc/meminfo, che su Windows e macOS non
-     * esiste: 0 -> budget 1 GB -> uno slot per layer, in silenzio. */
-    return compat_mem_available_gb();
-}
-
 static void expert_cache_init(GModel *m) {
     const Cfg *c = &m->c;
     const char *setting = getenv("GLM53_EXPERT_GB");
@@ -1291,36 +1286,56 @@ static void expert_cache_init(GModel *m) {
      * versi -- su una macchina piccola va in OOM, su una grande lascia RAM
      * inutilizzata mentre il disco fa tutto il lavoro, che e' esattamente
      * quello che e' successo alla prima esecuzione vera. */
-    double budget;
-    if (setting) budget = atof(setting);
-    else {
-        const double free_now = memory_available_gb();
-        budget = free_now - 3.0;
-        if (budget < 1.0) budget = 1.0;
-        if (getenv("GLM53_VERBOSE"))
-            fprintf(stderr, "budget esperti: %.1f GB (%.1f disponibili, 3 di margine)\n",
-                    budget, free_now);
-    }
     const int from = c->first_dense > m->layer_begin ? c->first_dense : m->layer_begin;
     int sparse = m->layer_end - from;
     if (sparse < 0) sparse = 0;
+    double budget;
+    if (setting) budget = atof(setting);
+    else {
+        /* MemAvailable counts reclaimable page cache as free. Sizing this LRU
+         * from it means allocating, as anonymous memory, the very pages the
+         * next slot miss would have been served from: both caches hold the
+         * same bytes, the model is paid for twice, and the cheap copy is the
+         * one that loses. So leave the model room to stay in page cache and
+         * take only what is left over. */
+        double total = 0.0, free_now = 0.0;
+        compat_meminfo_gb(&total, &free_now);      /* one pass, both fields */
+        /* the routed experts dominate; the rest of the weights are ~7% */
+        const double model_gb = (double)sparse * c->n_experts * (double)m->e_slot / 1e9 * 1.07;
+        double margin = total * 0.08;
+        if (margin < 4.0) margin = 4.0;
+        if (total <= 0.0 || model_gb >= total - margin) {
+            /* The model does not fit in RAM anyway, so page cache cannot help:
+             * keep as many slots as possible, exactly as before. `total <= 0`
+             * is "could not measure" and takes the same safe path. */
+            budget = free_now - 3.0;
+        } else {
+            budget = total - model_gb - margin;
+            if (budget > free_now - 3.0) budget = free_now - 3.0;
+        }
+        if (budget < 1.0) budget = 1.0;
+        if (getenv("GLM53_VERBOSE"))
+            fprintf(stderr, "expert budget: %.1f GB (%.1f total, %.1f model, "
+                            "%.1f margin, %.1f available)\n",
+                    budget, total, model_gb, margin, free_now);
+    }
     int cap = (int)((budget * 1e9) / ((double)m->e_slot * (sparse > 0 ? sparse : 1)));
     if (g_cap_override > 0) cap = g_cap_override;      /* scelta esplicita: vince */
     if (cap < 1) cap = 1;
     if (cap > c->n_experts) cap = c->n_experts;
 
     m->ecache = calloc((size_t)c->n_layers, sizeof(*m->ecache));
-    if (!m->ecache) { fprintf(stderr, "OOM sulla cache degli esperti\n"); exit(1); }
+    if (!m->ecache) { fprintf(stderr, "OOM allocating expert cache\n"); exit(1); }
     for (int i = from; i < m->layer_end; i++) {
         LCache *cache = &m->ecache[i];
         cache->cap = cap;
         cache->s = calloc((size_t)cap, sizeof(*cache->s));
-        if (!cache->s) { fprintf(stderr, "OOM sugli slot del layer %d\n", i); exit(1); }
+        if (!cache->s) { fprintf(stderr, "OOM allocating slots for layer %d\n", i); exit(1); }
         for (int j = 0; j < cap; j++) cache->s[j].eid = -1;
     }
     if (getenv("GLM53_VERBOSE"))
-        fprintf(stderr, "esperti: slot da %.1f MB, %d per layer su %d layer sparsi "
-                        "(%.1f GB residenti)\n",
+        fprintf(stderr, "experts: %.1f MB slots, %d per layer across %d sparse layers "
+                        "(%.1f GB resident)\n",
                 m->e_slot / 1e6, cap, sparse, (double)cap * sparse * m->e_slot / 1e9);
 }
 
@@ -1335,25 +1350,306 @@ static Slot *slot_find(GModel *m, int layer, int eid) {
     return NULL;
 }
 
+
+/* ---------- multi-SSD mirror for streamed experts ----------
+ *
+ * GLM-5.3 has its own expert loader and therefore cannot inherit the mirror
+ * routing used by the other engines.  st.h already owns replica validation
+ * and per-shard replica fds; glm53 only needs to choose a replica
+ * deterministically and use that fd for the actual expert read.
+ *
+ * Determinism matters: every load of (layer,eid) chooses the same drive,
+ * avoiding duplicate page-cache population and making the distribution
+ * reproducible.  Missing shards in a partial mirror fall back to primary.
+ */
+#define GLM53_MIR_REPS (1 + ST_MAX_MIR)
+
+static int glm53_mirror_active = 0;
+static int glm53_mirror_nrep = 1;
+static int glm53_mirror_cut[GLM53_MIR_REPS] = {256};
+
+static int glm53_expert_replica(int layer, int eid) {
+    if (!glm53_mirror_active) return 0;
+
+    uint32_t h = (uint32_t)layer * 2654435761u ^
+                 (uint32_t)eid   * 0x9E3779B9u;
+    h ^= h >> 16;
+    h *= 0x45d9f3bu;
+    h ^= h >> 16;
+
+    int hv = (int)(h & 255);
+    int r = 0;
+    while (r + 1 < glm53_mirror_nrep && hv >= glm53_mirror_cut[r])
+        r++;
+    return r;
+}
+
+
+
+/* Measure one drive with the same kind of large parallel reads used by
+ * streamed experts.  Prefer the direct/non-cached fd when available so the
+ * result reflects storage bandwidth instead of an already-warm page cache.
+ *
+ * The value is only a relative routing weight; absolute MB/s is not exposed
+ * as a performance promise.  A failed probe returns 1 so routing always has
+ * a usable positive weight. */
+static int glm53_mirror_probe_weight(GModel *m, int rep) {
+    enum { NREAD = 8 };
+    const size_t block = 19u * 1024u * 1024u;
+    const int64_t align = 4096;
+
+    int best_i = -1;
+    int64_t best_size = 0;
+
+    for (int i = 0; i < m->S.nfd; i++) {
+        int fd = st_fd_rep(&m->S, m->S.fds[i], rep);
+        if (fd < 0) continue;
+        if (m->S.sizes[i] < (int64_t)block * 2) continue;
+        if (m->S.sizes[i] > best_size) {
+            best_size = m->S.sizes[i];
+            best_i = i;
+        }
+    }
+
+    if (best_i < 0) return 1;
+
+    int primary_fd = m->S.fds[best_i];
+    int fd = st_direct_fd_rep(&m->S, primary_fd, rep);
+    if (fd < 0) fd = st_fd_rep(&m->S, primary_fd, rep);
+    if (fd < 0) return 1;
+
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+
+    int64_t bytes = 0;
+
+#ifdef _OPENMP
+#pragma omp parallel for reduction(+:bytes)
+#endif
+    for (int j = 0; j < NREAD; j++) {
+        void *buf = NULL;
+        if (posix_memalign(&buf, (size_t)align, block) != 0 || !buf)
+            continue;
+
+        int64_t usable = best_size - (int64_t)block - align;
+        int64_t off = ((int64_t)(j + 1) * usable) / (NREAD + 1);
+        off &= ~(align - 1);
+
+        ssize_t got;
+        do {
+            got = pread(fd, buf, block, off);
+        } while (got < 0 && errno == EINTR);
+
+        if (got > 0) bytes += got;
+        free(buf);
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+
+    double sec =
+        (double)(t1.tv_sec - t0.tv_sec) +
+        (double)(t1.tv_nsec - t0.tv_nsec) / 1e9;
+
+    if (sec <= 0.0 || bytes <= 0) return 1;
+
+    double mib_s = ((double)bytes / (1024.0 * 1024.0)) / sec;
+    int weight = (int)(mib_s + 0.5);
+
+    if (weight < 1) weight = 1;
+    if (weight > 1000000) weight = 1000000;
+
+    fprintf(stderr,
+            "[GLM53 MIRROR] probe drive %d: %.0f MiB/s\n",
+            rep, mib_s);
+
+    return weight;
+}
+
+static void glm53_mirror_setup(GModel *m, const char *primary_dir) {
+    const char *env = getenv("COLI_MODEL_MIRROR");
+    if (!env || !*env) env = getenv("SNAP_MIRROR");
+    if (!env || !*env) return;
+
+    st_mirror_reset(&m->S);
+
+    char dirs[4096];
+    snprintf(dirs, sizeof(dirs), "%s", env);
+
+    int nrep = 1;
+    char *p = dirs;
+
+    while (p && *p) {
+        char *sep = p;
+        while (*sep && *sep != ';' && *sep != ',') sep++;
+
+        int last = (*sep == 0);
+        *sep = 0;
+
+        while (*p == ' ') p++;
+        size_t n = strlen(p);
+        while (n && p[n - 1] == ' ') p[--n] = 0;
+
+        if (*p) {
+            if (!strcmp(p, primary_dir)) {
+                fprintf(stderr,
+                        "[GLM53 MIRROR] %s equals primary model dir -- ignored\n",
+                        p);
+            } else if (nrep >= GLM53_MIR_REPS) {
+                fprintf(stderr,
+                        "[GLM53 MIRROR] too many mirrors; max %d -- %s ignored\n",
+                        ST_MAX_MIR, p);
+            } else {
+                int nf = st_mirror_add(&m->S, p);
+                if (nf > 0) {
+                    fprintf(stderr,
+                            "[GLM53 MIRROR] replica %d: %s (%d/%d shards)\n",
+                            nrep, p, nf, m->S.nfd);
+                    nrep++;
+                } else {
+                    fprintf(stderr,
+                            "[GLM53 MIRROR] %s: no usable shards -- ignored\n",
+                            p);
+                }
+            }
+        }
+
+        p = last ? NULL : sep + 1;
+    }
+
+    if (nrep < 2) return;
+
+    glm53_mirror_nrep = nrep;
+
+    /*
+     * COLI_DISK_WEIGHTS is one positive integer per drive:
+     * primary,mirror1[,mirror2...].
+     *
+     * When it is unset or invalid, measure every active drive at startup
+     * using large parallel reads and derive the deterministic expert-routing
+     * split from the measured relative bandwidth.
+     */
+    int weight[GLM53_MIR_REPS] = {0};
+    int valid = 0;
+    const char *wenv = getenv("COLI_DISK_WEIGHTS");
+
+    if (wenv && *wenv) {
+        char wb[512];
+        snprintf(wb, sizeof(wb), "%s", wenv);
+
+        char *q = wb;
+        int nw = 0;
+        valid = 1;
+
+        while (q && *q && nw < GLM53_MIR_REPS) {
+            char *end = NULL;
+            long v = strtol(q, &end, 10);
+            if (end == q || v <= 0 || v > 1000000) {
+                valid = 0;
+                break;
+            }
+
+            weight[nw++] = (int)v;
+
+            while (*end == ' ') end++;
+            if (!*end) {
+                q = NULL;
+            } else if (*end == ',') {
+                q = end + 1;
+                while (*q == ' ') q++;
+            } else {
+                valid = 0;
+                break;
+            }
+        }
+
+        if (nw != nrep) valid = 0;
+    }
+
+    if (!valid) {
+        if (wenv && *wenv)
+            fprintf(stderr,
+                    "[GLM53 MIRROR] invalid COLI_DISK_WEIGHTS '%s' for %d drives; probing bandwidth\n",
+                    wenv, nrep);
+
+        for (int r = 0; r < nrep; r++)
+            weight[r] = glm53_mirror_probe_weight(m, r);
+    }
+
+    long total = 0;
+    for (int r = 0; r < nrep; r++) total += weight[r];
+
+    long accum = 0;
+    for (int r = 0; r < nrep; r++) {
+        accum += weight[r];
+        int cut = (int)((256L * accum + total / 2) / total);
+        if (cut < 1) cut = 1;
+        if (cut > 256) cut = 256;
+        glm53_mirror_cut[r] = cut;
+    }
+    glm53_mirror_cut[nrep - 1] = 256;
+
+    glm53_mirror_active = 1;
+
+    fprintf(stderr, "[GLM53 MIRROR] %d drives | routing", nrep);
+    int prev = 0;
+    for (int r = 0; r < nrep; r++) {
+        int share = glm53_mirror_cut[r] - prev;
+        fprintf(stderr, "%s%d%%",
+                r ? " / " : " ",
+                (int)((100L * share + 128) / 256));
+        prev = glm53_mirror_cut[r];
+    }
+    fprintf(stderr, "%s\n",
+            valid ? " (COLI_DISK_WEIGHTS)" : " (startup bandwidth probe)");
+}
+
+static int glm53_expert_read_replica(GModel *m, const ERef *ref, int layer, int eid) {
+    int rep = glm53_expert_replica(layer, eid);
+
+    /* A routed expert is one logical object. A partial mirror is allowed, but
+     * if even one of its six pieces is absent on the selected replica, route
+     * the WHOLE expert to the primary. Never mix pieces of one expert across
+     * drives. */
+    if (rep > 0) {
+        for (int p = 0; p < GLM53_EXPERT_PIECES; p++) {
+            if (st_fd_rep(&m->S, ref->fd[p], rep) < 0)
+                return 0;
+        }
+    }
+    return rep;
+}
+
 static void expert_read(GModel *m, int layer, int eid, Slot *slot) {
     const ERef *ref = &m->eref[(size_t)layer * m->c.n_experts + eid];
     int metal_slot = 0;
 #ifdef COLI_METAL
     metal_slot = g_metal_ready;
 #endif
-    /* The batched Metal MoE uses resolve() on expert pointers. st_map_shard_range
-     * may return a pointer inside an mmap rather than its 16-KiB-aligned base, so
-     * those views cannot be registered safely. Metal-active slots therefore own
-     * one stable aligned slab; CPU-only runs retain the zero-copy mmap fast path. */
+
+    int rep = glm53_expert_read_replica(m, ref, layer, eid);
+
+    /* The batched Metal MoE uses resolve() on expert pointers.
+     * st_map_shard_range() may return a pointer inside an mmap rather than its
+     * 16-KiB-aligned base, so those views cannot be registered safely.
+     * Metal-active slots therefore own one stable aligned slab; CPU-only runs
+     * retain the zero-copy mmap fast path, using the selected replica. */
     if (!metal_slot) {
         int mapped_ok = 1;
         for (int p = 0; p < GLM53_EXPERT_PIECES && mapped_ok; p++) {
-            const void *pr = st_map_shard_range(ref->fd[p], ref->off[p], m->e_len[p]);
-            if (!pr) { mapped_ok = 0; break; }
+            int fd = rep > 0 ? st_fd_rep(&m->S, ref->fd[p], rep) : ref->fd[p];
+            const void *pr = st_map_shard_range(fd, ref->off[p], m->e_len[p]);
+            if (!pr) {
+                mapped_ok = 0;
+                break;
+            }
             slot->piece[p] = (uint8_t *)pr;
         }
-        if (mapped_ok) { slot->eid = eid; return; }
+        if (mapped_ok) {
+            slot->eid = eid;
+            return;
+        }
     }
+
     /* Fallback/Metal path: write into memory owned by the slot. Metal requires
      * page alignment and a page-multiple registration length. The base stays
      * stable across LRU reuse, so registration happens only on first allocation. */
@@ -1369,8 +1665,8 @@ static void expert_read(GModel *m, int layer, int eid, Slot *slot) {
         slot->own = (uint8_t *)p;
         slot->own_len = need;
         if (!slot->own) {
-            fprintf(stderr, "OOM su uno slot esperto (%.1f MB): la cache esperti non ci sta "
-                            "in memoria; riduci con --ram N o GLM53_EXPERT_GB=N (#1375)\n",
+            fprintf(stderr, "OOM allocating expert slot (%.1f MB): the expert cache does not fit "
+                            "in memory; reduce it with --ram N or GLM53_EXPERT_GB=N (#1375)\n",
                     m->e_slot / 1e6);
             exit(1);
         }
@@ -1381,22 +1677,34 @@ static void expert_read(GModel *m, int layer, int eid, Slot *slot) {
         }
 #endif
     }
-    for (int p = 0; p < GLM53_EXPERT_PIECES; p++) slot->piece[p] = slot->own + m->e_at[p];
+
+    for (int p = 0; p < GLM53_EXPERT_PIECES; p++)
+        slot->piece[p] = slot->own + m->e_at[p];
+
     if (ref->contig) {
-        st_pread_full(ref->fd[0], slot->own, m->e_slot, ref->off[0], "expert");
+        int fd = rep > 0 ? st_fd_rep(&m->S, ref->fd[0], rep) : ref->fd[0];
+        st_pread_full(fd, slot->own, m->e_slot, ref->off[0], "expert");
     } else {
-        for (int p = 0; p < GLM53_EXPERT_PIECES; p++)
-            st_pread_full(ref->fd[p], slot->own + m->e_at[p], m->e_len[p],
-                          ref->off[p], "expert piece");
+        for (int p = 0; p < GLM53_EXPERT_PIECES; p++) {
+            int fd = rep > 0 ? st_fd_rep(&m->S, ref->fd[p], rep) : ref->fd[p];
+
+            st_pread_full(fd,
+                          slot->own + m->e_at[p],
+                          m->e_len[p],
+                          ref->off[p],
+                          "expert piece");
+        }
     }
+
     slot->eid = eid;
-    /* expert_read gira dentro a un ciclo parallelo: i contatori sono condivisi
-     * e senza questo sarebbero una corsa, cioe' numeri sbagliati proprio nel
-     * posto in cui si va a guardare per capire se il riuso funziona. */
+
+    /* expert_read runs inside a parallel load loop, so these counters are
+     * shared. */
 #ifdef _OPENMP
 #pragma omp atomic
 #endif
     m->miss++;
+
 #ifdef _OPENMP
 #pragma omp atomic
 #endif
@@ -1471,7 +1779,7 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
     int *chosen = malloc((size_t)tokens * topk * sizeof(int));
     float *weight = malloc((size_t)tokens * topk * sizeof(float));
     float *score = malloc((size_t)c->n_experts * sizeof(float));
-    if (!chosen || !weight || !score) { fprintf(stderr, "OOM nel router\n"); exit(1); }
+    if (!chosen || !weight || !score) { fprintf(stderr, "OOM in router\n"); exit(1); }
 
     /* --- primo tempo: il router, per ogni token --- */
     for (int t = 0; t < tokens; t++) {
@@ -1522,7 +1830,7 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
     float *sg = malloc((size_t)wide * sizeof(float));
     float *su = malloc((size_t)wide * sizeof(float));
     float *tmp = malloc((size_t)c->hidden * sizeof(float));
-    if (!sg || !su || !tmp) { fprintf(stderr, "OOM nel MoE\n"); exit(1); }
+    if (!sg || !su || !tmp) { fprintf(stderr, "OOM in MoE\n"); exit(1); }
 
     /* l'esperto condiviso e' sempre attivo e non passa dalla cache */
     for (int t = 0; t < tokens; t++)
@@ -1546,7 +1854,7 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
     /* unione dei distinti, nell'ordine in cui compaiono */
     int *union_ids = malloc((size_t)tokens * topk * sizeof(int));
     int n_union = 0;
-    if (!union_ids) { fprintf(stderr, "OOM sull'unione\n"); exit(1); }
+    if (!union_ids) { fprintf(stderr, "OOM building expert union\n"); exit(1); }
     for (int i = 0; i < tokens * topk; i++) {
         int seen = 0;
         for (int j = 0; j < n_union; j++) if (union_ids[j] == chosen[i]) { seen = 1; break; }
@@ -1557,7 +1865,7 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
     const int block = cache->cap;
     int *slot_of = malloc((size_t)block * sizeof(int));
     int *to_read = malloc((size_t)block * sizeof(int));
-    if (!slot_of || !to_read) { fprintf(stderr, "OOM sugli slot\n"); exit(1); }
+    if (!slot_of || !to_read) { fprintf(stderr, "OOM allocating slots\n"); exit(1); }
 
     for (int base = 0; base < n_union; base += block) {
         const int here = base + block <= n_union ? block : n_union - base;
@@ -1689,6 +1997,7 @@ static void model_load_range(GModel *m, const char *dir, int layer_begin,
                              int layer_end, int load_io) {
     load_cfg(&m->c, dir);
     st_init(&m->S, dir);
+    glm53_mirror_setup(m, dir);
     /* Il checkpoint reale annida il modello testuale sotto il wrapper vision;
      * un export solo-testo no. Si sceglie una volta, da un tensore che deve
      * esistere in entrambe le forme. */
@@ -1734,7 +2043,7 @@ static void model_load_range(GModel *m, const char *dir, int layer_begin,
         snprintf(first, sizeof(first), "%slayers.%d.mlp.experts.0.gate_proj.weight",
                  P, probe_layer);
         st_tensor *probe_expert = st_find(&m->S, first);
-        if (!probe_expert) { fprintf(stderr, "manca %s\n", first); exit(1); }
+        if (!probe_expert) { fprintf(stderr, "missing %s\n", first); exit(1); }
         m->streaming = probe_expert->dtype == 3;
     }
     if (m->streaming) {
@@ -1837,8 +2146,8 @@ static void model_load_range(GModel *m, const char *dir, int layer_begin,
     if (getenv("COLI_METAL") && atoi(getenv("COLI_METAL"))) {
         g_metal_ready = coli_metal_init() && coli_metal_available();
         fprintf(stderr, g_metal_ready
-                ? "Metal: attivo sulle matrici residenti\n"
-                : "Metal: nessun device utilizzabile, resto su CPU\n");
+                ? "Metal: active for resident matrices\n"
+                : "Metal: no usable device, falling back to CPU\n");
     }
 #endif
 #ifdef COLI_VULKAN
@@ -1854,9 +2163,10 @@ static void model_load_range(GModel *m, const char *dir, int layer_begin,
         if (given && strstr(given, ".spv")) snprintf(spv, sizeof(spv), "%s", given);
         else snprintf(spv, sizeof(spv), "%s/qmatmul.spv", given ? given : "shaders");
         g_vk_ready = coli_vk_init(spv) && coli_vk_available();
+        if (g_vk_ready) coli_vk_set_swiglu_limit(m->c.swiglu_limit);
         fprintf(stderr, g_vk_ready
-                ? "Vulkan: attivo sulle matrici residenti\n"
-                : "Vulkan: nessun device utilizzabile (%s), resto su CPU\n", spv);
+                ? "Vulkan: active for resident matrices\n"
+                : "Vulkan: no usable device (%s), falling back to CPU\n", spv);
     }
 #endif
     /* La cache si dimensiona qui, non prima: quanto si puo' spendere dipende
@@ -1898,7 +2208,7 @@ static void vision_load(GModel *m) {
     m->vision.merger_down = load_f32(m, "%smerger.down_proj.weight", V);
 
     m->vblocks = calloc((size_t)c->vis_layers, sizeof(*m->vblocks));
-    if (!m->vblocks) { fprintf(stderr, "OOM sui blocchi vision\n"); exit(1); }
+    if (!m->vblocks) { fprintf(stderr, "OOM allocating vision blocks\n"); exit(1); }
     for (int b = 0; b < c->vis_layers; b++) {
         ColiVisionBlock *vb = &m->vblocks[b];
         vb->norm1 = load_f32(m, "%sblocks.%d.norm1.weight", V, b);
@@ -1929,19 +2239,19 @@ static void vision_load(GModel *m) {
 static float *vision_encode(GModel *m, const float *patches,
                             int grid_h, int grid_w, int *out_tokens) {
     if (!m->has_vision) {
-        fprintf(stderr, "questo checkpoint non porta la torre vision\n");
+        fprintf(stderr, "this checkpoint does not include the vision tower\n");
         exit(1);
     }
     const int tokens = coli_vision_output_tokens(&m->vision.config, grid_h, grid_w);
     if (tokens <= 0) {
-        fprintf(stderr, "griglia %dx%d non divisibile per merge %d\n",
+        fprintf(stderr, "grid %dx%d is not divisible by merge size %d\n",
                 grid_h, grid_w, m->vision.config.merge);
         exit(1);
     }
     float *out = malloc((size_t)tokens * m->vision.config.out_hidden * sizeof(float));
-    if (!out) { fprintf(stderr, "OOM sugli embedding vision\n"); exit(1); }
+    if (!out) { fprintf(stderr, "OOM allocating vision embeddings\n"); exit(1); }
     if (coli_vision_forward(out, &m->vision, patches, grid_h, grid_w) != 0) {
-        fprintf(stderr, "la torre vision ha rifiutato l'ingresso\n");
+        fprintf(stderr, "vision tower rejected the input\n");
         exit(1);
     }
     /* La torre esce a out_hidden; il flusso testuale vuole hidden. Il
@@ -1961,10 +2271,10 @@ static float *vision_encode(GModel *m, const float *patches,
 static GSession *session_open(const GModel *m, int cap) {
     const Cfg *c = &m->c;
     GSession *s = calloc(1, sizeof(*s));
-    if (!s) { fprintf(stderr, "OOM sulla sessione\n"); exit(1); }
+    if (!s) { fprintf(stderr, "OOM allocating session\n"); exit(1); }
     s->cap = cap;
     s->layer = calloc((size_t)c->n_layers, sizeof(*s->layer));
-    if (!s->layer) { fprintf(stderr, "OOM sugli stati di layer\n"); exit(1); }
+    if (!s->layer) { fprintf(stderr, "OOM allocating layer states\n"); exit(1); }
     if (c->kda_proj)
         s->kda_scratch = malloc((size_t)coli_kda_scratch_floats(c->kda_heads, c->kda_hd,
                                                                 c->kda_hd) * sizeof(float));
@@ -1975,14 +2285,14 @@ static GSession *session_open(const GModel *m, int cap) {
             st->ikeys = malloc((size_t)cap * c->index_hd * sizeof(float));
             st->igates = malloc((size_t)cap * c->index_hd * sizeof(float));
             if (!st->latent || !st->ikeys || !st->igates) {
-                fprintf(stderr, "OOM sulla cache del layer %d\n", i); exit(1);
+                fprintf(stderr, "OOM allocating cache for layer %d\n", i); exit(1);
             }
         } else if (c->kda_proj) {
             st->kda_state = calloc((size_t)c->kda_heads * c->kda_hd * c->kda_hd,
                                    sizeof(float));
             st->kda_window = calloc((size_t)3 * c->kda_proj * c->conv_k, sizeof(float));
             if (!st->kda_state || !st->kda_window) {
-                fprintf(stderr, "OOM sullo stato KDA del layer %d\n", i); exit(1);
+                fprintf(stderr, "OOM allocating KDA state for layer %d\n", i); exit(1);
             }
         }
     }
@@ -1990,8 +2300,8 @@ static GSession *session_open(const GModel *m, int cap) {
         int full = 0;
         for (int i = 0; i < c->n_layers; i++) if (c->is_full[i]) full++;
         const double per_token = (double)full * (c->kv_lora + 2 * c->index_hd) * sizeof(float);
-        fprintf(stderr, "cache: %.1f KB per token su %d layer DSA "
-                        "(%.2f GB a %d posizioni)\n",
+        fprintf(stderr, "cache: %.1f KB per token across %d DSA layers "
+                        "(%.2f GB at %d positions)\n",
                 per_token / 1024.0, full, per_token * cap / 1e9, cap);
     }
     return s;
@@ -2026,7 +2336,7 @@ static float *run_layers(GModel *m, GSession *s, float *streams, float *next,
     float *post = malloc((size_t)n * H * sizeof(float));
     float *comb = malloc((size_t)n * H * H * sizeof(float));
     if (!collapsed || !normed || !branch || !post || !comb) {
-        fprintf(stderr, "OOM nei temporanei del passaggio\n"); exit(1);
+        fprintf(stderr, "OOM allocating forward-pass temporaries\n"); exit(1);
     }
 
     for (int i = begin; i < end; i++) {
@@ -2077,6 +2387,9 @@ static float *run_layers(GModel *m, GSession *s, float *streams, float *next,
 static void mat_release(Mat *mat) {
 #ifdef COLI_METAL
     if (mat->metal) coli_metal_tensor_free((ColiMetalTensor *)mat->metal);
+#endif
+#ifdef COLI_VULKAN
+    if (mat->vk) coli_vk_tensor_free((ColiVkTensor *)mat->vk);
 #endif
     free((void *)mat->f); free((void *)mat->q8);
     free((void *)mat->q4); free((void *)mat->s);
@@ -2165,13 +2478,41 @@ static void model_load(GModel *m, const char *dir) {
  * `image_token_id`, quindi qui non c'e' nulla da inserire: si sostituisce la
  * riga dell'embedding testuale con quella della torre e le posizioni restano
  * quelle che sono. Prompt di solo testo passano vision=NULL, n_vision=0. */
+/* Canale logprobs (modalita jev). La lettura del prefill qui costa quasi
+ * niente: forward_span calcola gia i logit di OGNI posizione e forward_prefill
+ * li butta via tenendo solo l'ultima riga. Basta non buttarli.
+ *
+ * La fotografia invece serve davvero: 34 layer su 68 sono KDA e portano una
+ * ricorrenza che non si riavvolge, ed e esattamente quello che dice il
+ * commento degli slot piu sotto. Si salvano kda_state e kda_window di ogni
+ * layer KDA; le righe DSA non entrano nella foto perche sono indicizzate per
+ * posizione e restano dove sono finche la sessione vive. */
+static int    g_echo_k = 0;
+static unsigned long long g_echo_id = 0;
+static Tok   *g_echo_tok = NULL;
+static int    g_echo_base = 0;            /* posizione assoluta del primo token letto */
+static const float *g_echo_pin_logit = NULL;
+static float *g_echo_prev = NULL;         /* ultima riga di logit del pezzo precedente: il
+                                           * prefill va a pezzi, e chi predice il primo token
+                                           * di un pezzo sta in quello prima */
+
+static void glm_echo(unsigned long long id, int pos, int token,
+                     const float *lo, int V, int k){
+    char tail[1024]; coli_logprob_tail(tail, sizeof tail, lo, V, token, k);
+    char piece[512]; int n = g_echo_tok ? tok_decode(g_echo_tok, &token, 1, piece, (int)sizeof piece) : 0;
+    if(n<0) n=0;
+    printf("ECHO %llu %d %d%s\n", id, n, pos, tail);
+    if(n>0) fwrite(piece,1,(size_t)n,stdout);
+    putchar('\n'); fflush(stdout);
+}
+
 static float *forward_span(GModel *m, GSession *s, const int *tokens, int n,
                            const float *vision, int n_vision) {
     const Cfg *c = &m->c;
     const int H = c->hc_mult;
     const int start = s->filled;   /* NON 'base': nel ciclo dei layer e' gia' preso */
     if (start + n > s->cap) {
-        fprintf(stderr, "contesto esaurito: %d posizioni su %d\n", start + n, s->cap);
+        fprintf(stderr, "context exhausted: %d positions of %d\n", start + n, s->cap);
         exit(1);
     }
     const int D = c->hidden;
@@ -2185,14 +2526,14 @@ static float *forward_span(GModel *m, GSession *s, const int *tokens, int n,
         /* Un id fuori dal vocabolario legge oltre la tabella degli embedding.
          * Da CLI sarebbe un errore di battitura; da server e' input di rete. */
         if (tokens[t] < 0 || tokens[t] >= c->vocab) {
-            fprintf(stderr, "token %d fuori dal vocabolario (0..%d)\n",
+            fprintf(stderr, "token %d is outside the vocabulary (0..%d)\n",
                     tokens[t], c->vocab - 1);
             exit(1);
         }
         if (vision && c->image_token >= 0 && tokens[t] == c->image_token) {
             if (consumed >= n_vision) {
-                fprintf(stderr, "il prompt ha piu' token immagine (%d+) degli "
-                                "embedding forniti (%d)\n", consumed + 1, n_vision);
+                fprintf(stderr, "prompt has more image tokens (%d+) than "
+                                "provided embeddings (%d)\n", consumed + 1, n_vision);
                 exit(1);
             }
             row = vision + (size_t)consumed++ * D;
@@ -2206,8 +2547,8 @@ static float *forward_span(GModel *m, GSession *s, const int *tokens, int n,
      * modello un'immagine diversa da quella che il chiamante crede di aver
      * passato: e' un errore, non un caso limite. */
     if (consumed != n_vision) {
-        fprintf(stderr, "%d embedding vision forniti ma solo %d token immagine "
-                        "nel prompt\n", n_vision, consumed);
+        fprintf(stderr, "%d vision embeddings provided but only %d image tokens "
+                        "are present in the prompt\n", n_vision, consumed);
         exit(1);
     }
 
@@ -2265,7 +2606,7 @@ static float *forward_prefill(GModel *m, GSession *s, const int *tokens, int n,
     if (chunk > n) chunk = n;
 
     float *all = keep_all ? malloc((size_t)n * c->vocab * sizeof(float)) : NULL;
-    if (keep_all && !all) { fprintf(stderr, "OOM sui logit del prefill\n"); exit(1); }
+    if (keep_all && !all) { fprintf(stderr, "OOM allocating prefill logits\n"); exit(1); }
     float *last = NULL;
     int used_vision = 0;
 
@@ -2287,12 +2628,30 @@ static float *forward_prefill(GModel *m, GSession *s, const int *tokens, int n,
                    (size_t)here * c->vocab * sizeof(float));
             free(part);
         } else {
+            /* La posizione p predice il token p+1: il predittore del token in
+             * `at+i` sta in `at+i-1`, che e la riga i-1 di questo pezzo, o
+             * l'ultima del pezzo prima, o la fotografia per il primissimo. */
+            if (g_echo_k > 0 && g_echo_id) {
+                for (int i = 0; i < here; i++) {
+                    const float *pred;
+                    if (at + i == 0)   pred = g_echo_pin_logit;
+                    else if (i == 0)   pred = g_echo_prev;
+                    else               pred = part + (size_t)(i - 1) * c->vocab;
+                    glm_echo(g_echo_id, g_echo_base + at + i, tokens[at + i],
+                             pred, c->vocab, pred ? g_echo_k : 0);
+                }
+                if (!g_echo_prev)
+                    g_echo_prev = malloc((size_t)c->vocab * sizeof(float));
+                if (g_echo_prev)
+                    memcpy(g_echo_prev, part + (size_t)(here - 1) * c->vocab,
+                           (size_t)c->vocab * sizeof(float));
+            }
             free(last);
             last = part;
             if (here > 1) {
                 /* si tiene solo l'ultima riga */
                 float *tail = malloc((size_t)c->vocab * sizeof(float));
-                if (!tail) { fprintf(stderr, "OOM sui logit\n"); exit(1); }
+                if (!tail) { fprintf(stderr, "OOM allocating logits\n"); exit(1); }
                 memcpy(tail, last + (size_t)(here - 1) * c->vocab,
                        (size_t)c->vocab * sizeof(float));
                 free(last);
@@ -2301,7 +2660,7 @@ static float *forward_prefill(GModel *m, GSession *s, const int *tokens, int n,
         }
     }
     if (vision && used_vision != n_vision) {
-        fprintf(stderr, "%d embedding vision forniti ma %d segnaposto nel prompt\n",
+        fprintf(stderr, "%d vision embeddings provided but %d placeholders are present in the prompt\n",
                 n_vision, used_vision);
         exit(1);
     }
@@ -2331,31 +2690,21 @@ static int argmax(const float *v, int n) {
 
 /* Gli id di fine generazione. GLM ne dichiara piu' di uno (fine turno, fine
  * testo, fine blocco strumenti) e fermarsi solo sul primo vuol dire vedere il
- * modello continuare a parlare oltre la sua risposta. */
+ * modello continuare a parlare oltre la sua risposta. Vengono da
+ * generation_config.json, o da config.json (top level o text_config) quando
+ * quel file non c'e': un container convertito senza generation_config.json
+ * non si fermava mai (#1478). */
 static int load_stops(const char *dir, int *out, int max) {
-    char path[1024];
-    snprintf(path, sizeof(path), "%s/generation_config.json", dir);
-    FILE *f = fopen(path, "rb");
-    if (!f) return 0;
-    fseek(f, 0, SEEK_END); long size = ftell(f); fseek(f, 0, SEEK_SET);
-    char *text = malloc((size_t)size + 1);
-    if (!text || fread(text, 1, (size_t)size, f) != (size_t)size) {
-        free(text); fclose(f); return 0;
+    const char *source = "";
+    int n = coli_load_stop_ids(dir, out, max, &source);
+    static int noted = 0;
+    if (!noted) {
+        noted = 1;
+        if (n) fprintf(stderr, "[glm53] %d stop id(s) from %s\n", n, source);
+        else fprintf(stderr, "[glm53] no eos_token_id in generation_config.json or config.json: "
+                             "generation stops only at the token limit\n");
     }
-    text[size] = 0; fclose(f);
-    char *arena = NULL;
-    jval *root = json_parse(text, &arena);
-    int found = 0;
-    if (root && root->t == J_OBJ) {
-        jval *eos = json_get(root, "eos_token_id");
-        if (eos && eos->t == J_NUM && found < max) out[found++] = (int)eos->num;
-        else if (eos && eos->t == J_ARR)
-            for (int i = 0; i < eos->len && found < max; i++)
-                if (eos->kids[i]->t == J_NUM) out[found++] = (int)eos->kids[i]->num;
-    }
-    free(arena);
-    free(text);
-    return found;
+    return n;
 }
 
 /* ================= protocollo serve =================
@@ -2406,7 +2755,7 @@ static int sample_token(const float *logits, int vocab) {
         probability = realloc(probability, (size_t)vocab * sizeof(float));
         order = realloc(order, (size_t)vocab * sizeof(int));
         room = vocab;
-        if (!probability || !order) { fprintf(stderr, "OOM nel campionamento\n"); exit(1); }
+        if (!probability || !order) { fprintf(stderr, "OOM in sampling\n"); exit(1); }
     }
     float top = -INFINITY;
     for (int i = 0; i < vocab; i++) if (logits[i] > top) top = logits[i];
@@ -2456,7 +2805,18 @@ typedef struct {
     GSession *session;
     int *tokens;                          /* la sequenza che lo slot tiene */
     int n, cap;
+    /* Scatti dello stato (SUBMIT pin=1): la ricorrenza KDA, gli id e i logit
+     * finali. Piu di uno perche i prefissi utili sono annidati: le istruzioni
+     * condivise da mille richieste e istruzioni+domanda condivise dalle
+     * alternative di una sola (pin_pool.h). La sessione ci sta dentro per
+     * identita: se lo slot ne ha aperta un'altra, le righe DSA di quelle
+     * posizioni non esistono piu e gli scatti non valgono niente. */
+    ColiPinPool pins;
+    GSession *pin_session;
 } KVSlot;
+
+/* la ricorrenza KDA di uno scatto: stato e finestra di ogni strato lineare */
+typedef struct { float **state, **window; int n_layers; } Glm53PinState;
 
 static KVSlot g_slots[GLM53_MAX_SLOTS];
 static int g_n_slots = 0;
@@ -2471,11 +2831,97 @@ static void slots_init(const GModel *m) {
     g_slot_context = context ? atoi(context) : 8192;
     if (g_slot_context < 64) g_slot_context = 64;
     if (getenv("GLM53_VERBOSE"))
-        fprintf(stderr, "slot KV: %d da %d posizioni\n", g_n_slots, g_slot_context);
+        fprintf(stderr, "KV slots: %d with %d positions each\n", g_n_slots, g_slot_context);
     (void)m;
 }
 
+/* Uno scatto muore con la sessione che descrive. */
+static void glm53_pin_state_free(void *v) {
+    Glm53PinState *st = (Glm53PinState *)v;
+    if (!st) return;
+    for (int i = 0; i < st->n_layers; i++) {
+        if (st->state)  free(st->state[i]);
+        if (st->window) free(st->window[i]);
+    }
+    free(st->state); free(st->window); free(st);
+}
+
+static void slot_pin_drop(const GModel *m, KVSlot *slot) {
+    (void)m;
+    coli_pin_pool_clear(&slot->pins, glm53_pin_state_free);
+    slot->pin_session = NULL;
+}
+
+static int slot_pin_save(const GModel *m, KVSlot *slot, const int *tokens, int n,
+                         const float *logit) {
+    const Cfg *c = &m->c;
+    if (!slot->session || n < 1 || !logit) return 0;
+    /* Sessione nuova: gli scatti vecchi parlano di righe DSA che non esistono
+     * piu, e rimetterli risponderebbe da posizioni inventate, in silenzio. */
+    if (slot->pin_session != slot->session) slot_pin_drop(m, slot);
+    coli_pin_pool_init(&slot->pins, c->vocab);
+    ColiPin *k = coli_pin_store(&slot->pins, tokens, n, logit);
+    if (!k) return 0;
+    const size_t ns = (size_t)c->kda_heads * c->kda_hd * c->kda_hd;
+    const size_t nw = (size_t)3 * c->kda_proj * c->conv_k;
+    Glm53PinState *st = (Glm53PinState *)k->state;
+    if (st && st->n_layers != c->n_layers) { glm53_pin_state_free(st); st = NULL; }
+    if (!st) {
+        st = (Glm53PinState *)calloc(1, sizeof(*st));
+        if (!st) { k->len = 0; return 0; }
+        st->n_layers = c->n_layers;
+        st->state  = (float **)calloc((size_t)c->n_layers, sizeof(float *));
+        st->window = (float **)calloc((size_t)c->n_layers, sizeof(float *));
+        if (!st->state || !st->window) { glm53_pin_state_free(st); k->len = 0; return 0; }
+        for (int i = 0; i < c->n_layers; i++) {
+            if (c->is_full[i] || !slot->session->layer[i].kda_state) continue;
+            st->state[i]  = (float *)malloc(ns * sizeof(float));
+            st->window[i] = (float *)malloc(nw * sizeof(float));
+            if (!st->state[i] || !st->window[i]) { glm53_pin_state_free(st); k->len = 0; return 0; }
+        }
+    }
+    for (int i = 0; i < c->n_layers; i++) {
+        GLayerState *ls = &slot->session->layer[i];
+        if (c->is_full[i] || !ls->kda_state || !st->state[i]) continue;
+        memcpy(st->state[i],  ls->kda_state,  ns * sizeof(float));
+        memcpy(st->window[i], ls->kda_window, nw * sizeof(float));
+    }
+    k->state = st;
+    slot->pin_session = slot->session;
+    return 1;
+}
+
+/* Rimette lo scatto piu profondo che sia un prefisso stretto di questo prompt,
+ * se la sessione che l'ha prodotto e ancora quella dello slot. Torna quante
+ * posizioni sono gia' fatte, 0 se non si applica. */
+static int slot_pin_restore(const GModel *m, KVSlot *slot, const int *tokens, int n) {
+    const Cfg *c = &m->c;
+    if (!slot->session || slot->pin_session != slot->session) return 0;
+    const size_t ns = (size_t)c->kda_heads * c->kda_hd * c->kda_hd;
+    const size_t nw = (size_t)3 * c->kda_proj * c->conv_k;
+    int s = coli_pin_best(&slot->pins, tokens, n);
+    while (s >= 0) {
+        ColiPin *k = &slot->pins.slot[s];
+        Glm53PinState *st = (Glm53PinState *)k->state;
+        if (st && k->len <= slot->session->filled) {
+            for (int i = 0; i < c->n_layers; i++) {
+                GLayerState *ls = &slot->session->layer[i];
+                if (c->is_full[i] || !ls->kda_state || !st->state[i]) continue;
+                memcpy(ls->kda_state,  st->state[i],  ns * sizeof(float));
+                memcpy(ls->kda_window, st->window[i], nw * sizeof(float));
+            }
+            slot->session->filled = k->len;
+            coli_pin_touch(&slot->pins, s);
+            return k->len;
+        }
+        k->len = 0;              /* lo scatto pretende posizioni che non ci sono */
+        s = coli_pin_best(&slot->pins, tokens, n);
+    }
+    return 0;
+}
+
 static void slot_reset(const GModel *m, KVSlot *slot) {
+    slot_pin_drop(m, slot);
     if (slot->session) session_close(m, slot->session);
     slot->session = NULL;
     slot->n = 0;
@@ -2492,7 +2938,7 @@ static int slot_shared(const KVSlot *slot, const int *tokens, int n) {
 static void slot_remember(KVSlot *slot, const int *tokens, int n) {
     if (n > slot->cap) {
         slot->tokens = realloc(slot->tokens, (size_t)n * sizeof(int));
-        if (!slot->tokens) { fprintf(stderr, "OOM sulla storia dello slot\n"); exit(1); }
+        if (!slot->tokens) { fprintf(stderr, "OOM allocating slot history\n"); exit(1); }
         slot->cap = n;
     }
     memcpy(slot->tokens, tokens, (size_t)n * sizeof(int));
@@ -2526,6 +2972,7 @@ typedef struct {
     float temp, top_p;
     char *payload;
     int plen;
+    int logprobs, pin;   /* SUBMIT logprobs=k / pin=1 */
 } ServeReq;
 
 static int g_stop[16], g_nstop = 0;
@@ -2547,9 +2994,9 @@ static void arm_stops(const char *dir, Tok *tokenizer, int batched) {
             for (int i = 0; i < g_nstop; i++) if (g_stop[i] == id) seen = 1;
             if (!seen) g_stop[g_nstop++] = id;
         }
-    fprintf(stderr, "[stop] %d token di stop:", g_nstop);
+    fprintf(stderr, "[stop] %d stop tokens:", g_nstop);
     for (int i = 0; i < g_nstop; i++) fprintf(stderr, " %d", g_stop[i]);
-    fprintf(stderr, "%s\n", batched ? " (modalita' batch: solo fine testo)" : "");
+    fprintf(stderr, "%s\n", batched ? " (batch mode: end-of-text only)" : "");
 }
 
 static int is_stop(int token) {
@@ -2568,6 +3015,16 @@ static void serve_line(const char *format, ...) {
 static void serve_data(unsigned long long id, const char *text, int n) {
     printf("DATA %llu %d\n", id, n);
     fwrite(text, 1, (size_t)n, stdout);
+    putchar('\n');
+    fflush(stdout);
+}
+
+/* Come serve_data ma con la coda numerica del canale logprobs. Si usa solo se
+ * la richiesta l'ha chiesto: senza, il frame e quello di sempre. */
+static void serve_data_lp(unsigned long long id, const char *text, int n,
+                          const char *tail) {
+    printf("DATA %llu %d%s\n", id, n, tail ? tail : "");
+    if (n > 0) fwrite(text, 1, (size_t)n, stdout);
     putchar('\n');
     fflush(stdout);
 }
@@ -2606,10 +3063,27 @@ static int serve_read_req(ServeReq *q, char *verb, size_t verb_size) {
         return 1;
     }
     if (strcmp(verb, "SUBMIT")) return 1;
-    if (sscanf(header, "SUBMIT %llu %d %d %d %f %f", &q->id, &q->slot, &q->plen,
-               &q->max_tokens, &q->temp, &q->top_p) != 6) {
+    int header_used = 0;
+    if (sscanf(header, "SUBMIT %llu %d %d %d %f %f%n", &q->id, &q->slot, &q->plen,
+               &q->max_tokens, &q->temp, &q->top_p, &header_used) != 6) {
         strcpy(verb, "BAD_FRAME");
         return 1;
+    }
+    /* Chiavi facoltative dopo i sei campi posizionali (logprobs=k, pin=1): le
+     * legge lo stesso parser degli altri motori, cosi la modalita jev si
+     * chiede allo stesso modo ovunque. Una richiesta che non ne porta resta
+     * identica a prima, byte per byte. */
+    q->logprobs = 0; q->pin = 0;
+    {
+        const char *rest = header + header_used;
+        while (*rest == ' ') rest++;
+        if (*rest && *rest != '\n') {
+            char tailbuf[256];
+            snprintf(tailbuf, sizeof tailbuf, "%s", rest);
+            for (char *w = tailbuf; *w; w++) if (*w == '\n' || *w == '\r') { *w = 0; break; }
+            ColiSubmit ext; memset(&ext, 0, sizeof ext);
+            if (coli_submit_ext(tailbuf, &ext)) { q->logprobs = ext.logprobs; q->pin = ext.pin; }
+        }
     }
     if (q->plen < 0 || q->plen > (1 << 24)) { strcpy(verb, "BAD_FRAME"); return 1; }
     q->payload = malloc((size_t)q->plen + 1);
@@ -2622,6 +3096,18 @@ static int serve_read_req(ServeReq *q, char *verb, size_t verb_size) {
     q->payload[q->plen] = 0;
     int trailing = fgetc(stdin);
     (void)trailing;                        /* il '\n' di chiusura del frame */
+    /* max_tokens=0 vale solo in modalita jev ("leggi e fermati"), e lo si sa
+     * solo dopo aver letto le chiavi. Il rifiuto sta DOPO che payload e '\n'
+     * sono stati consumati: rifiutare prima lascerebbe i byte del prompt nello
+     * stream e disallineerebbe ogni frame successivo, che e' esattamente il
+     * guaio che il commento di serve_cancel_pending descrive. Questo motore non
+     * passa dal parser condiviso, quindi la regola va ripetuta qui o resta
+     * l'unico ad accettare uno zero che per tutti gli altri e' malformato. */
+    if (q->max_tokens < 1 && !(q->max_tokens == 0 && q->logprobs > 0)) {
+        free(q->payload); q->payload = NULL; q->plen = 0;
+        strcpy(verb, "BAD_FRAME");
+        return 1;
+    }
     return 1;
 }
 
@@ -2721,8 +3207,12 @@ static int serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
         return 0;
     }
     if (total >= room) {
+        /* The gateway turns CONTEXT_EXCEEDED into a 400 context_length_exceeded;
+         * BAD_REQUEST reads as an engine fault, a 500 the client cannot act on.
+         * tok_encode stops at `room`, so prompt_tokens is a lower bound. */
         free(sequence);
-        serve_line("ERROR %llu BAD_REQUEST\n", q->id);
+        serve_line("ERROR %llu CONTEXT_EXCEEDED prompt_tokens=%d requested=%d capacity=%d\n",
+                   q->id, total, q->max_tokens, room);
         return 0;
     }
 
@@ -2730,7 +3220,11 @@ static int serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
     const double s_attn = m->t_attn, s_ffn = m->t_ffn, s_disk = m->t_disk, s_head = m->t_head;
     const uint64_t s_fw = m->forwards;
     int emitted = 0, limited = 0;
-    const int budget = q->max_tokens > 0 ? q->max_tokens : 256;
+    /* 0 con logprobs>0 = "leggi e fermati" (modalita jev), non un default da
+     * riempire: e' cosi che un menu chiuso non paga un passo di decodifica per
+     * ogni opzione. Senza logprobs il comportamento e quello di prima. */
+    const int budget = q->max_tokens > 0 ? q->max_tokens
+                     : (q->logprobs > 0 ? 0 : 256);
 
     /* Quanto di questo prompt e' gia' nella sessione.
      *
@@ -2748,6 +3242,12 @@ static int serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
     int shared = 0;
     if (cached > 0 && cached < total && slot_shared(slot, sequence, total) >= cached)
         shared = cached;
+    /* La fotografia si prova sempre, non solo quando il riuso in avanti
+     * fallisce: se lo stato vivo e gia il prompt condiviso, il riuso normale
+     * scatterebbe lo stesso ma il primo token fresco resterebbe senza
+     * predittore, e quindi senza logprob, proprio quello che serve. */
+    int pinned = slot_pin_restore(m, slot, sequence, total);
+    if (pinned > 0) shared = pinned;
     if (shared <= 0) {
         slot_reset(m, slot);
         slot->session = session_open(m, room);
@@ -2779,8 +3279,21 @@ static int serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
     }
 
     const int reused = shared;
+    g_echo_k = q->logprobs; g_echo_id = q->logprobs > 0 ? q->id : 0;
+    g_echo_tok = tokenizer; g_echo_base = shared;
+    {   /* i logit dello scatto rimesso: predicono il primo token fresco */
+        int ps = coli_pin_best(&slot->pins, sequence, total);
+        g_echo_pin_logit = (pinned > 0 && shared == pinned && ps >= 0)
+                           ? slot->pins.slot[ps].logit : NULL;
+    }
     float *logits = forward_prefill(m, slot->session, sequence + shared,
                                     total - shared, vision, n_vision, 0);
+    g_echo_k = 0; g_echo_id = 0;   /* la lettura riguarda il prefill, non la decodifica */
+    if (q->pin && logits &&
+        !slot_pin_save(m, slot, sequence, total, logits) && getenv("GLM53_VERBOSE"))
+        fprintf(stderr, "[PIN] fotografia non riuscita, si riparte da capo ogni volta\n");
+    else if (q->pin)
+        fprintf(stderr, "[PIN] stato fotografato a %d token\n", total);
     GSession *session = slot->session;
     int rows = 1, ctl = SERVE_CTL_NONE, input_eof = 0;
     for (int step = 0; step < budget; step++) {
@@ -2800,7 +3313,11 @@ static int serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
         if (!input_eof) ctl = serve_cancel_pending(q->id, &input_eof);
         if (ctl != SERVE_CTL_NONE) break;
         if (total >= room) { limited = 1; break; }
-        int next = sample_token(logits + (size_t)(rows - 1) * m->c.vocab, m->c.vocab);
+        const float *row = logits + (size_t)(rows - 1) * m->c.vocab;
+        int next = sample_token(row, m->c.vocab);
+        char lptail[1024]; lptail[0] = 0;
+        if (q->logprobs > 0)
+            coli_logprob_tail(lptail, sizeof lptail, row, m->c.vocab, next, q->logprobs);
         free(logits);
         logits = NULL;
         if (is_stop(next)) break;
@@ -2808,7 +3325,8 @@ static int serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
         emitted++;
         char piece[512];
         int written = tok_decode(tokenizer, &next, 1, piece, sizeof(piece) - 1);
-        serve_data(q->id, piece, written);
+        if (q->logprobs > 0) serve_data_lp(q->id, piece, written, lptail);
+        else serve_data(q->id, piece, written);
         if (step + 1 == budget) { limited = 1; break; }
         logits = forward_span(m, session, &next, 1, NULL, 0);
         rows = 1;
@@ -2965,6 +3483,14 @@ static void serve_loop(GModel *m, Tok *tokenizer) {
             int gateway_gone = serve_one(m, tokenizer, &q) < 0;
             free(q.payload);
             if (gateway_gone) break;
+            /* La griglia va rimandata DOPO ogni turno, non solo dopo READY: al
+             * boot la cache degli esperti e vuota, e quella fotografia a freddo
+             * restava l'unica che il cruscotto avesse mai visto -- tutto grigio,
+             * RAM 0, tutto su disco, per sempre. Le HITS erano gia' per turno,
+             * ed e' per questo che il lampeggio funzionava e il colore no.
+             * inkling.c, kimi_k3.c, qwen38.c, deepseek_v41.c e colibri.c fanno
+             * gia' cosi'. */
+            emap_emit(m);
         } else if (!strcmp(verb, "IMAGE")) {
             /* annunciata: nessuna risposta, la si usa al SUBMIT che segue */
         } else if (!strcmp(verb, "BAD_FRAME")) {
@@ -2989,6 +3515,12 @@ static void serve_loop(GModel *m, Tok *tokenizer) {
 
 #ifndef GLM53_NO_MAIN
 int main(int argc, char **argv) {
+    /* Physical-core team sizing, the same shared helper colibri/inkling/
+     * kimi_k3/olmoe/deepseek-v41 call. This engine has no OpenMP sizing of its
+     * own, so on an SMT host it ran one thread per logical CPU; #718 measured
+     * +2.3x from this alone on a 16C/32T part and the effect grows with the
+     * logical/core ratio. OMP_NUM_THREADS wins, COLI_NO_OMP_TUNE=1 disables. */
+    coli_omp_tune_threads("glm53");
     const char *dir = NULL, *ids = NULL, *patch_file = NULL, *prompt_text = NULL;
     int greedy = 0, show_logits = 0, grid_h = 0, grid_w = 0;
     for (int i = 1; i < argc; i++) {
@@ -3014,7 +3546,7 @@ int main(int argc, char **argv) {
      * openai_server.py. */
     if (getenv("SERVE")) {
         const char *snap = getenv("SNAP");
-        if (!snap) { fprintf(stderr, "SERVE senza SNAP: non so quale modello aprire\n"); return 2; }
+        if (!snap) { fprintf(stderr, "SERVE requires SNAP to select a model\n"); return 2; }
         GModel served;
         memset(&served, 0, sizeof(served));
         model_load(&served, snap);
@@ -3025,6 +3557,7 @@ int main(int argc, char **argv) {
         tok_load(&serve_tok, tokenizer_path);
         const char *batch = getenv("SERVE_BATCH");
         arm_stops(snap, &serve_tok, batch && atoi(batch));
+        coli_rt_term_arm();   /* SIGTERM must reach the save below (#1629) */
         serve_loop(&served, &serve_tok);
         glm53_telemetry_save();
         rt_destroy();
@@ -3033,17 +3566,17 @@ int main(int argc, char **argv) {
     }
 
     if (!dir || (!ids && !prompt_text)) {
-        fprintf(stderr, "uso: %s --model DIR (--prompt TESTO | --ids a,b,c)\n"
+        fprintf(stderr, "usage: %s --model DIR (--prompt TEXT | --ids a,b,c)\n"
                         "         [--greedy N] [--logits] [--patches FILE.f32 --grid HxW]\n",
                 argv[0]);
         return 2;
     }
     if (ids && prompt_text) {
-        fprintf(stderr, "--prompt e --ids sono due modi di dire la stessa cosa\n");
+        fprintf(stderr, "--prompt and --ids are mutually exclusive\n");
         return 2;
     }
     if (!!patch_file != (grid_h > 0 && grid_w > 0)) {
-        fprintf(stderr, "--patches e --grid vanno insieme\n");
+        fprintf(stderr, "--patches and --grid must be used together\n");
         return 2;
     }
     int capacity = 1024, count = 0;
@@ -3069,7 +3602,7 @@ int main(int argc, char **argv) {
             p = (*end == ',') ? end + 1 : end;
         }
     }
-    if (!count) { fprintf(stderr, "nessun token nel prompt\n"); return 2; }
+    if (!count) { fprintf(stderr, "no tokens in prompt\n"); return 2; }
 
     GModel model;
     memset(&model, 0, sizeof(model));     /* contatori e puntatori opzionali */
@@ -3084,20 +3617,20 @@ int main(int argc, char **argv) {
     if (patch_file) {
         const ColiVisionConfig *vc = &model.vision.config;
         if (!model.has_vision) {
-            fprintf(stderr, "--patches ma il checkpoint non porta la torre vision\n");
+            fprintf(stderr, "--patches requested but this checkpoint does not include the vision tower\n");
             return 2;
         }
         const size_t per_patch = (size_t)vc->in_channels * vc->temporal * vc->patch * vc->patch;
         const size_t wanted = (size_t)grid_h * grid_w * per_patch;
         FILE *f = fopen(patch_file, "rb");
-        if (!f) { fprintf(stderr, "non apro %s\n", patch_file); return 2; }
+        if (!f) { fprintf(stderr, "cannot open %s\n", patch_file); return 2; }
         float *patches = malloc(wanted * sizeof(float));
-        if (!patches) { fprintf(stderr, "OOM sulle patch\n"); return 2; }
+        if (!patches) { fprintf(stderr, "OOM allocating patches\n"); return 2; }
         size_t got = fread(patches, sizeof(float), wanted, f);
         /* Una patch corta darebbe comunque un'uscita, con la coda letta da
          * memoria non inizializzata: meglio fermarsi e dire di quanto. */
         if (got != wanted) {
-            fprintf(stderr, "%s: %zu float su %zu attesi per una griglia %dx%d\n",
+            fprintf(stderr, "%s: got %zu floats, expected %zu for a %dx%d grid\n",
                     patch_file, got, wanted, grid_h, grid_w);
             return 2;
         }
@@ -3113,7 +3646,7 @@ int main(int argc, char **argv) {
     const double prefill_start = now_s();
     float *logits = forward_prefill(&model, session, tokens, count, vision, n_vision, 1);
     if (getenv("GLM53_VERBOSE"))
-        fprintf(stderr, "caricamento %.1fs, prefill %d token in %.1fs\n",
+        fprintf(stderr, "load %.1fs, prefill %d tokens in %.1fs\n",
                 load_seconds, count, now_s() - prefill_start);
     printf("teacher_forcing");
     for (int t = 0; t < count; t++)

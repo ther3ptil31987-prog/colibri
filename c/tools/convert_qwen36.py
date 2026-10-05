@@ -17,11 +17,22 @@ Design notes (must stay in sync with c/qwen36.c):
     pack_int4(). The qs layout (per-row f32 scales) is identical either way. This matches
     what c/qwen36.c's load_expert_merged expects: it detects int4 by ON-DISK SIZE (N/2 bytes)
     and unpacks in-place to int8, so the rest of the MoE path is unchanged.
+  * --down-bits 8 (with --ebits <= 4) is the MIXED layout: gate and up stay packed int4,
+    down_proj is int8 (--down-gs groups along its input, 0 = per row). One merged_weight per
+    expert still: uint8 [gate int4 packed | up int4 packed | down int8], 2*inter*hidden bytes
+    (int4: 1.5x, int8: 3x), qs = [gate scales | up scales | down scales]. Written to meta as
+    expert_down_bits / expert_down_gs. Q4_K_M keeps down/output in Q6_K; this is the
+    experiment #1370 asked for, with the engine reading each matrix in its own format.
   * Attention + router + shared-expert + norms stay f16 (they are tiny vs experts).
   * Real Qwen3.6 is a vision-language checkpoint: config dims live under `text_config`,
     and weight keys are prefixed `model.language_model.`. Both are handled transparently.
   * The fused expert tensors `mlp.experts.gate_up_proj` / `down_proj` are split per expert
     into the merged_weight layout (gate_up = [gate; up] along dim 0).
+  * Every tensor name is classified against tools/qwen36_tensor_kinds.py before the first
+    shard is read. The `mtp.*` head and the `visual.*` tower are skipped ON PURPOSE and
+    reported with a count; a name the contract does not know stops the conversion. A
+    converter that silently drops what it does not recognise produces a container that
+    loads and is quietly missing a tensor (GLM-5.3 precedent, #1045).
   * Head dims are derived from the actual weight shapes (authoritative), not from config
     heuristics, because Qwen3.6's qk split (q_head_dim=512, k/v_head_dim=256, rope over
     256 dims) does not match naive head_dim=hidden/n_heads.
@@ -32,9 +43,12 @@ Usage (cloud, e.g. Colab free CPU):
 
 Usage (local tiny model for end-to-end testing):
   python tools/convert_qwen36.py --model ../qwen36_tiny --out ../qwen36_tiny_i4 --ebits 8
+
+Usage (mixed: int4 gs64 gate/up, int8 down -- the #1370 experiment):
+  python tools/convert_qwen36.py --model <hf> --out ./qwen36_i4_gs64_d8 --ebits 4 --gs 64 --down-bits 8
 """
 
-import argparse, json, math, os, struct, sys
+import argparse, json, math, os, struct, sys, tempfile
 from pathlib import Path
 
 # Windows: force UTF-8 output
@@ -49,7 +63,7 @@ try:
     import torch
     from safetensors.numpy import safe_open as safe_open_np
     from safetensors.torch import safe_open as safe_open_pt
-    from safetensors.torch import save_file
+    from safetensors.torch import save_file, load_file
 except ImportError as exc:
     sys.exit(f"Missing dependencies: {exc}. Install: pip install torch safetensors")
 
@@ -101,7 +115,7 @@ def quantize_row_grouped(w: "torch.Tensor", bits: int, gs: int):
     return q, scales.view(O, ng)
 
 
-def make_merged(gate, up, down, ebits, gs=0):
+def make_merged(gate, up, down, ebits, gs=0, down_bits=0, down_gs=0):
     gsz = gs   # local `gs` is rebound to the gate scales below -- keep the group size safe
     """gate/up: [inter, H]; down: [H, inter] (torch, any fp).
     -> (merged_weight, qs f32 1D).
@@ -113,20 +127,31 @@ def make_merged(gate, up, down, ebits, gs=0):
     The engine (c/qwen36.c) currently reads ebits>=5 (int8); the int4 path is WIP.
     qs (per-row f32 scales) is identical in both cases.
     """
-    def q(t):
-        if gsz:
-            qt, s = quantize_row_grouped(t, ebits, gsz)   # [O, ng] scales
+    def q(t, bits, group):
+        if group:
+            qt, s = quantize_row_grouped(t, bits, group)   # [O, ng] scales
             return qt, s.reshape(-1)
-        qt, s = quantize_row(t.reshape(t.shape[0], -1), ebits)  # rows along dim0
+        qt, s = quantize_row(t.reshape(t.shape[0], -1), bits)  # rows along dim0
         return qt, s
-    gq, gs = q(gate)
-    uq, us = q(up)
-    dq, ds = q(down)
-    mw_i8 = torch.cat([gq.flatten(), uq.flatten(), dq.flatten()]).contiguous()
-    if ebits <= 4:
-        mw = pack_int4(mw_i8)              # uint8, 2x4-bit per byte -> HALF size (true int4)
+    gq, gs = q(gate, ebits, gsz)
+    uq, us = q(up, ebits, gsz)
+    mixed = bool(down_bits) and down_bits != ebits
+    if mixed:
+        if not (ebits <= 4 and down_bits >= 5):
+            raise ValueError(f"mixed layout needs --ebits <= 4 and --down-bits >= 5 (got {ebits}/{down_bits})")
+        # gate|up packed int4, down int8 in the same uint8 slab: 2*inter*hidden bytes,
+        # which is neither the int4 (1.5x) nor the int8 (3x) size -- that is how the
+        # engine tells the three layouts apart, from the bytes, not from meta.
+        dq, ds = q(down, down_bits, down_gs)
+        gu = pack_int4(torch.cat([gq.flatten(), uq.flatten()]).contiguous())
+        mw = torch.cat([gu, dq.flatten().to(torch.int8).view(torch.uint8)]).contiguous()
     else:
-        mw = mw_i8.to(torch.int8)          # int8 storage (ebits 5..8)
+        dq, ds = q(down, ebits, gsz)
+        mw_i8 = torch.cat([gq.flatten(), uq.flatten(), dq.flatten()]).contiguous()
+        if ebits <= 4:
+            mw = pack_int4(mw_i8)              # uint8, 2x4-bit per byte -> HALF size (true int4)
+        else:
+            mw = mw_i8.to(torch.int8)          # int8 storage (ebits 5..8)
     qs = torch.cat([gs, us, ds]).contiguous().float()
     return mw, qs
 
@@ -144,7 +169,6 @@ def _unpack_int4(packed: "torch.Tensor") -> "torch.Tensor":
 
 def _selftest():
     """Round-trip check for the true-int4 packing used by --ebits<=4."""
-    import random
     print("=== int4 pack/unpack selftest ===")
     ok = True
     for ebits in (2, 3, 4):
@@ -155,9 +179,7 @@ def _selftest():
         d = torch.randn(H, inter) * 3
         mw, qs = make_merged(g, u, d, ebits)
         # serialize to safetensors + reload (exercises the real dtype path)
-        import tempfile, os
         td = tempfile.mkdtemp()
-        from safetensors.torch import save_file, load_file
         save_file({"merged_weight": mw, "qs": qs}, os.path.join(td, "e0.safetensors"))
         back = load_file(os.path.join(td, "e0.safetensors"))
         mw_r = back["merged_weight"]
@@ -184,23 +206,33 @@ def _selftest():
     mw8, _ = make_merged(g, u, d, 8)
     print(f"  ebits=8: dtype={mw8.dtype} (expected int8), bytes={mw8.numel()}")
     ok = ok and (mw8.dtype == torch.int8)
+    # mixed layout: gate/up int4 (gs 8 here), down int8 per row -- the bytes must be
+    # exactly the int4 packing of gate|up followed by the int8 rows of down, the size
+    # 2*inter*hidden, and the scales [gate ng | up ng | down per row]
+    inter, H, gsz = 8, 16, 8
+    g = torch.randn(inter, H) * 3; u = torch.randn(inter, H) * 3; d = torch.randn(H, inter) * 3
+    mwm, qsm = make_merged(g, u, d, 4, gs=gsz, down_bits=8, down_gs=0)
+    gq, _ = quantize_row_grouped(g, 4, gsz); uq, _ = quantize_row_grouped(u, 4, gsz)
+    dq, dsc = quantize_row(d, 8)
+    gu_ref = pack_int4(torch.cat([gq.flatten(), uq.flatten()]).contiguous())
+    n_gu = gu_ref.numel()
+    same_gu = bool(torch.equal(mwm[:n_gu], gu_ref))
+    same_d = bool(torch.equal(mwm[n_gu:].view(torch.int8), dq.flatten().to(torch.int8)))
+    size_ok = mwm.numel() == 2 * inter * H
+    ng = H // gsz
+    scales_ok = qsm.numel() == 2 * inter * ng + H and bool(torch.allclose(qsm[-H:], dsc.float()))
+    print(f"  mixed int4gs{gsz}+down int8: dtype={mwm.dtype} bytes={mwm.numel()} (expected {2*inter*H}) "
+          f"gate/up={same_gu} down={same_d} scales={scales_ok}")
+    ok = ok and mwm.dtype == torch.uint8 and same_gu and same_d and size_ok and scales_ok
     print("SELFTEST", "PASS" if ok else "FAIL")
     sys.exit(0 if ok else 1)
 
 
-def resolve_prefix(keys):
-    """Return the layer-weight prefix so that `prefix + "layers.{i}."` matches the
-    actual weight keys.  Handles the common layouts:
-      * 'model.'                for `model.layers.0...`            (standard HF Qwen3 MoE)
-      * 'model.language_model.' for `model.language_model.layers.0...` (some VL checkpoints)
-    """
-    for k in keys:
-        if k.startswith("model.language_model.layers."):
-            return "model.language_model."
-    for k in keys:
-        if k.startswith("model.layers."):
-            return "model."
-    return ""
+# Tensor-name contract: classify() places every name or raises. Kept torch-free
+# in its own module so the test that pins it to the real checkpoint indexes
+# runs wherever the registry tests run.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from qwen36_tensor_kinds import classify, resolve_prefix, skip_reason, UnknownTensor  # noqa: E402
 
 
 def main():
@@ -210,6 +242,11 @@ def main():
     src.add_argument("--model", help="Local HF checkpoint directory")
     ap.add_argument("--out", required=False, help="Output container directory")
     ap.add_argument("--ebits", type=int, default=4, help="Expert quant bits (2..8, default 4)")
+    ap.add_argument("--down-bits", type=int, default=0,
+                    help="bits for down_proj only (5..8; needs --ebits <= 4): the mixed layout, "
+                         "int4 gate/up + int8 down in one slab. 0 = same as --ebits")
+    ap.add_argument("--down-gs", type=int, default=0,
+                    help="scale group size along down_proj's input for --down-bits (0 = per row)")
     ap.add_argument("--gs", type=int, default=0,
                     help="Group size for expert scales (e.g. 64). 0 = per-row (default). "
                          "Group-scaled containers need engine support (expert_gs in meta).")
@@ -237,6 +274,11 @@ def main():
 
     if not 2 <= args.ebits <= 8:
         sys.exit(f"--ebits must be 2..8 (got {args.ebits})")
+    if args.down_bits and args.down_bits != args.ebits:
+        if not (args.ebits <= 4 and 5 <= args.down_bits <= 8):
+            sys.exit(f"--down-bits {args.down_bits} needs --ebits <= 4 and 5..8 (got --ebits {args.ebits})")
+        if args.down_gs < 0:
+            sys.exit("--down-gs must be >= 0")
 
     token = args.hf_token or os.environ.get("HF_TOKEN")
     if args.repo:
@@ -302,13 +344,46 @@ def main():
                 for k in f.keys():
                     wm[k] = sh.name
 
-    # ---- detect prefix + layer count from weights ----
-    sample_layer_keys = [k for k in wm if ".layers.0." in k or ".layers.0." in k]
-    prefix = resolve_prefix(wm.keys())
-    # find max layer index present
+    # ---- classify every tensor name before touching a shard ----
+    # 5 KB of index settles whether the next hundreds of GB make sense: an
+    # unknown name stops here, a skipped subtree is counted and named.
     import re
-    layer_ids = set(int(m) for m in re.findall(r"\." + re.escape(prefix) + r"layers\.(\d+)\.", " ".join(wm.keys())))
+    prefix = resolve_prefix(wm.keys())
+    layer_map = {}      # layer index -> [keys]
+    global_map = {}     # kind -> key
+    skipped = {}        # group -> count
+    unknown = []
+    for k in wm:
+        try:
+            placed = classify(k, prefix)
+        except UnknownTensor:
+            unknown.append(k)
+            continue
+        if placed[0] == "layer":
+            layer_map.setdefault(placed[1], []).append(k)
+        elif placed[0] == "global":
+            global_map[placed[1]] = k
+        else:
+            skipped[placed[1]] = skipped.get(placed[1], 0) + 1
+    if unknown:
+        shown = "\n  ".join(unknown[:12])
+        more = f"\n  ... and {len(unknown) - 12} more" if len(unknown) > 12 else ""
+        sys.exit(f"ERROR: {len(unknown)} tensor name(s) this converter cannot place "
+                 f"(tools/qwen36_tensor_kinds.py):\n  {shown}{more}\n"
+                 "Refusing to convert: a container missing or blindly carrying a tensor "
+                 "loads and answers wrongly. Extend the contract if the name is legitimate.")
+    for group, count in sorted(skipped.items()):
+        declared = ""
+        if group == "mtp":
+            declared = f", config mtp_num_hidden_layers={mcfg.get('mtp_num_hidden_layers')!r}"
+        print(f"skipping {count} `{group}.*` tensor(s): {skip_reason(group)}{declared}")
+    if mcfg.get("mtp_num_hidden_layers") and "mtp" not in skipped:
+        print(f"note: config declares mtp_num_hidden_layers={mcfg['mtp_num_hidden_layers']} "
+              "but the checkpoint carries no mtp.* tensors")
+    layer_ids = set(layer_map)
     n_layers_weight = (max(layer_ids) + 1) if layer_ids else mcfg.get("num_hidden_layers", 0)
+    print(f"tensor kinds: {sum(len(v) for v in layer_map.values())} in {len(layer_ids)} layers, "
+          f"{len(global_map)} globals, prefix {prefix!r}")
 
     layer_types = mcfg.get("layer_types")
     if layer_types is None:
@@ -327,16 +402,18 @@ def main():
     shard_layers = {}     # shard name -> set of layer ids needing it (-1 = globals)
 
     def layer_keys(i):
-        p = f"{prefix}layers.{i}."
-        return [k for k in wm if k.startswith(p)]
-
+        return layer_map.get(i, [])
     for i in all_idx:
         for k in layer_keys(i):
             shard_layers.setdefault(wm[k], set()).add(i)
-    globals_keys = [k for k in (f"{prefix}embed_tokens.weight",
-                                "lm_head.weight", f"{prefix}lm_head.weight",
-                                f"{prefix}norm.weight")
-                    if k in wm]
+    missing_layers = [i for i in all_idx if i not in layer_map]
+    if missing_layers:
+        sys.exit(f"ERROR: config declares {len(all_idx)} layers but the checkpoint has no "
+                 f"tensors for layer(s) {missing_layers[:8]}")
+    globals_keys = [global_map[kind] for kind in ("embed_tokens.weight", "lm_head.weight",
+                                                  "norm.weight") if kind in global_map]
+    if len(globals_keys) != 3:
+        sys.exit(f"ERROR: expected embed_tokens, lm_head and final norm, found {sorted(global_map)}")
     for k in globals_keys:
         shard_layers.setdefault(wm[k], set()).add(-1)
 
@@ -439,7 +516,8 @@ def main():
         # ---- MoE experts: handle BOTH layouts the source may use ----
         #  (a) FUSED:  model.layers.i.mlp.experts.gate_up_proj [E,2*inter,H]
         #              + model.layers.i.mlp.experts.down_proj    [E,H,inter]
-        #  (b) SEPARATE (standard HF Qwen3 MoE, incl. the real 35B):
+        #  (b) SEPARATE (transformers save_pretrained on the text model, e.g. the tiny fixture;
+        #      the real 35B and 2.4T checkpoints both ship the FUSED layout):
         #              model.layers.i.mlp.experts.{e}.gate_proj [inter,H]
         #              model.layers.i.mlp.experts.{e}.up_proj   [inter,H]
         #              model.layers.i.mlp.experts.{e}.down_proj [H,inter]
@@ -454,7 +532,7 @@ def main():
                 dk = k.replace("gate_up_proj", "down_proj")
                 down = get_tensor(dk).float()        # [E, H, inter]
                 for e in range(E):
-                    mw, qs = make_merged(gate[e], up[e], down[e], args.ebits, gs=args.gs)
+                    mw, qs = make_merged(gate[e], up[e], down[e], args.ebits, gs=args.gs, down_bits=args.down_bits, down_gs=args.down_gs)
                     tens[f"model.layers.{a}.mlp.experts.{e}.merged_weight"] = mw
                     tens[f"model.layers.{a}.mlp.experts.{e}.qs"] = qs
                 continue
@@ -466,7 +544,7 @@ def main():
         for e in sorted(sep):
             d = sep[e]
             if "gate_proj" in d and "up_proj" in d and "down_proj" in d:
-                mw, qs = make_merged(d["gate_proj"], d["up_proj"], d["down_proj"], args.ebits, gs=args.gs)
+                mw, qs = make_merged(d["gate_proj"], d["up_proj"], d["down_proj"], args.ebits, gs=args.gs, down_bits=args.down_bits, down_gs=args.down_gs)
                 tens[f"model.layers.{a}.mlp.experts.{e}.merged_weight"] = mw
                 tens[f"model.layers.{a}.mlp.experts.{e}.qs"] = qs
             else:
@@ -538,6 +616,10 @@ def main():
         if qn is not None:
             meta["qk_rope_head_dim"] = qn[0]
         meta["expert_gs"] = args.gs   # 0 = per-row scales; >0 = group size along input dim
+        if args.down_bits and args.down_bits != args.ebits:
+            # mixed layout (docstring): down_proj in its own format, gate/up as ebits/gs
+            meta["expert_down_bits"] = args.down_bits
+            meta["expert_down_gs"] = args.down_gs
         meta["head_dim"] = meta.get("k_head_dim", meta.get("q_head_dim", 256))
         meta["rope_dim"] = meta.get("qk_rope_head_dim", meta["head_dim"] // 4)
     # ---- DeltaNet (linear_attention) dims. From config (authoritative for dn; unlike the
