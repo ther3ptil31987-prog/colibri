@@ -33,8 +33,13 @@ sys.path.insert(0, str(ROOT))
 import family_registry as fr  # noqa: E402
 
 
-BACKEND_OBJECTS = ("CUDA_OBJ", "METAL_OBJ", "VK_OBJ", "VK_SPV", "INK_CUDA_OBJ",
-                   "QWEN36_TIER_SRC")
+# VK_OBJ/VK_SPV are not on the list: since #1830 every engine links the Vulkan
+# backend in a VK=1 build, and in the engines that link nothing else it only puts
+# the resident matrices on the device, opt-in (COLI_VULKAN=1), with no VRAM tier
+# for the planner to size and no GPU for it to select. What the flag promises is
+# exactly that tier and that selection, so a Vulkan-only engine stays CPU-only to
+# the planner.
+BACKEND_OBJECTS = ("CUDA_OBJ", "METAL_OBJ", "INK_CUDA_OBJ", "QWEN36_TIER_OBJ")
 
 
 def engine_rule(artifact: str) -> str:
@@ -48,6 +53,11 @@ def engine_rule(artifact: str) -> str:
 class RegistryEngineAgreementTest(unittest.TestCase):
     def test_every_engine_reads_its_declared_context_variable(self):
         for family in fr.FAMILIES:
+            if family.modality != "text":
+                # No context window to cap: the launcher refuses --ctx for an
+                # image model instead of setting a variable (coli, env_for_engine).
+                self.assertEqual(family.limits.context_env, "", family.id)
+                continue
             with self.subTest(family=family.id):
                 env = family.limits.context_env
                 source = (ROOT / f"{family.engine_artifact}.c").read_text(

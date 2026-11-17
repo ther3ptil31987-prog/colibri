@@ -32,6 +32,18 @@ int main(void) {
     CHECK(strcmp(json_get(root, "unicode")->str, "λ 🚀") == 0);
     json_free(root);
 
+    /* An unpaired surrogate is not a Unicode scalar. Checked parse rejects it;
+     * a paired surrogate (the rocket above) still decodes. Legacy stays permissive. */
+    CHECK(json_parse_checked("\"\\uD800\"") == NULL);
+    CHECK(json_parse_checked("\"\\uDE80\"") == NULL);
+    CHECK(json_parse_checked("\"\\uD800\\u0041\"") == NULL);
+    root = json_parse_checked("\"\\uD83D\\uDE80\"");
+    CHECK(root && strcmp(root->str, "🚀") == 0);
+    json_free(root);
+    root = json_parse("\"\\uD800\"", NULL);
+    CHECK(root && root->t == J_STR);
+    json_free(root);
+
     /* Checked key lookup must not alias a name through a decoded NUL. The
      * legacy API still returns its original permissive representation. */
     const char *nul_key="{\"x\\u0000ignored\":1}";
@@ -66,6 +78,40 @@ int main(void) {
             json_free(root);
         }
     }
+
+    /* The qpack reader goes through json_parse_checked: exact grammar, no
+     * trailing input, no NUL inside an object key. */
+    root = json_parse_checked(" {\"exact\":[0,-2.5,3e2]} \n");
+    CHECK(root && root->t == J_OBJ);
+    json_free(root);
+
+    static const char *malformed[] = {
+        "{\"a\" 1}",
+        "{\"a\":\"unterminated}",
+        "{\"a\":1",
+        "{\"a\":1} trailing",
+        "{\"a\":1,}",
+        "[1,]",
+        "{\"a\":1e}",
+        "{\"magic\\u0000suffix\":\"QPACK\"}",
+        "{\"a\":1}\v"
+    };
+    for (size_t i = 0; i < sizeof(malformed) / sizeof(malformed[0]); i++)
+        CHECK(json_parse_checked(malformed[i]) == NULL);
+
+    /* Overflow to infinity is not a value a checked reader can store. */
+    CHECK(json_parse_checked("1e9999") == NULL);
+    CHECK(json_parse_checked("{\"a\":-1e9999}") == NULL);
+    root = json_parse("1e9999", NULL);
+    CHECK(root && !isfinite(root->num));
+    json_free(root);
+    root = json_parse_checked("1e308");
+    CHECK(root && isfinite(root->num));
+    json_free(root);
+    root = json_parse_checked("3e2");
+    CHECK(root && root->num == 300.0);
+    json_free(root);
+
 
     puts("json tests: ok");
     return 0;
